@@ -1,0 +1,682 @@
+---
+title: "Proyecto Final"
+author: "Juan Emilio García Martínez y Adrián Jesús Peña Rodríguez"
+date: "06 de Junio de 2018"
+output: word_document
+
+
+---
+Práctica realizada por Juan Emilio García Martínez y Adrián Jesús Peña Rodríguez.
+
+Para el correcto funcionamiento de la práctica es necesario tener instaladas y activadas las siguientes librerias: "glmnet", "caret", "nnet", "mlogit", "randomForest", "rattle", "e1071", "lubridate", "Hmisc", "corrplot"  y opcionalmente "doParallel" para paralelizar algunas funciones costosas computacionalmente en paralelo.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(glmnet)
+library(nnet)
+library(mlogit)
+
+library(randomForest)
+library(rattle)
+library(caret)
+library(e1071)
+library(lubridate)
+library(Hmisc)
+library(corrplot)
+library(ROCR)
+set.seed(1234)
+
+library(doParallel)
+
+```
+
+## PROBLEMA DE CLASIFICACIÓN (binaria): Occupancy Detection Data Set"
+
+### 1. Problema a resolver
+
+El problema en si trata de ajustar varios modelos sobre dicha base de datos para decidir si una habitación está ocupada o no, es decir, estamos ante un problema de clasificación binaria.
+
+La base de datos está compuesta por los siguientes datos experimentales:
+  - Fecha.
+  - Temperatura (medida en celsius).
+  - Humedad (%)
+  - Luz (medida en Lux).
+  - CO2 (medido en ppm).
+  - Radio de humedad (medida derivada de la cantidad de temperatura y la humedad relativa, medida en kg de vapor de agua/kg aire).
+  
+### 2. Forma de proceder
+
+Después de analizar los datos y aplicar algunos procesos para la **elección de características** como ver las correlaciones entre variables, si tenemos valores dispersos o anormales, entre otros subprocesos de preprocesado, probaremos distintos modelos con las técnicas de *regresión logísitca* (lineal), *random forest* y *Support Vector Machine* (no lineal).
+Las pruebas que haremos sobre cada una de las técnicas serán probar distintos conjuntos de variables, estimando los parámetros e hyperparámetros óptimos para cada uno de los modelos  y medir mediante la *matriz de confusión* y *curva ROC* para posteriormente compararlos todos y quedarnos con el mejor.
+  
+### 3. Previo análisis de los datos.
+
+Leemos y preparamos nuestras estructuras de datos para el posterior análisis:
+
+```{r}
+# Loading datasets
+datatraining = read.table("datos/datatraining.txt",header=TRUE,sep=",")
+datatesting = read.table("datos/datatest.txt",header=TRUE,sep=",")
+datatesting2 = read.table("datos/datatest2.txt",header=TRUE,sep=",")
+
+#convertimos a factor
+datatraining$Occupancy = as.factor(datatraining$Occupancy)
+datatesting$Occupancy  = as.factor(datatesting$Occupancy)
+datatesting2$Occupancy  = as.factor(datatesting2$Occupancy)
+
+# Formateamos la fecha, para poder tratarla después
+datatraining$date = as.POSIXct(datatraining$date,tz="UTC") 
+datatesting$date = as.POSIXct(datatesting$date,tz="UTC") 
+datatesting2$date = as.POSIXct(datatesting2$date,tz="UTC") 
+
+# Funciones para poder tratar las fechas mas fácilmente
+#obtener segundos
+second_day = function(x) {
+        # x is an object in posixct format
+        s = hour(x)*3600+minute(x)*60+second(x)
+        
+}
+
+#comprobar si fin de semana o dia entre semana
+weekend_weekday = function(x) {
+        val = weekdays(x)
+        if (val == "Saturday" | val == "Sunday") {
+                val2 = "Weekend"
+        }
+        else {
+                val2= "Weekday"
+        }
+        return(val2)
+}
+
+#pasar a valores enteros el tipo de dia
+Relevel_weekend = function(x) {
+        
+        if (x == "Weekend") {
+                val2 = 0
+        }
+        else {
+                val2= 1
+        }
+        return(val2)
+}
+
+# añadimos columnas segundos y weekend/weekday  en dataset_b
+
+#training
+datatraining_b = datatraining
+datatraining_b$NSM = second_day(datatraining_b$date)
+datatraining_b$WeekStatus =unlist(lapply(datatraining$date,weekend_weekday))
+datatraining_b$WeekStatus =as.factor(datatraining_b$WeekStatus)
+
+datatraining_b$WeekStatus = unlist(lapply(datatraining_b$WeekStatus,Relevel_weekend))
+
+#datatesting  (dos datasets)
+datatesting_b = datatesting
+datatesting_b$NSM = second_day(datatesting_b$date)
+datatesting_b$WeekStatus =unlist(lapply(datatesting_b$date,weekend_weekday))
+datatesting_b$WeekStatus =as.factor(datatesting_b$WeekStatus)
+
+datatesting_b$WeekStatus = unlist(lapply(datatesting_b$WeekStatus, Relevel_weekend))
+
+datatesting2_b = datatesting2
+datatesting2_b$NSM = second_day(datatesting2_b$date)
+datatesting2_b$WeekStatus =unlist(lapply(datatesting2_b$date,weekend_weekday))
+datatesting2_b$WeekStatus =as.factor(datatesting2_b$WeekStatus)
+
+datatesting2_b$WeekStatus = unlist(lapply(datatesting2_b$WeekStatus, Relevel_weekend))
+
+##END CREACION DE DATASET
+```
+*Resumen de las estructuras de datos* que tenemos hasta ahora para el posterior ajuste: tenemos seis datasets que principalmente se dividen en dos grupos, un grupo diferenciado por el sufijo "_b" y otro que no lo tiene.
+
+  - Sin el sufijo "_b": datasets que NO contienen las columnas NSM(segundos en el dia medido) y WeekStatus(tipo de dia de la semana)
+  - Con el sufijo "_b": datasets que si contienen estas columnas.
+  
+Para cada grupo disponemos de los siguientes datasets:
+  - training: 8143 muestras de 7 variables donde el 79% son no ocupadas y un 21% ocupadas.
+  - testing1: 2665 muestras de 7 variables donde el 64% son no ocupadas y el 36% ocupadas.
+  - testing2: 9752 muestras de 7 variables donde el 79% son no ocupadas y el 21% ocupadas.
+  
+Una vez tenemos nuestras estructuras de datos construidas, las analizamos:
+
+```{r}
+#Proporciones de la ocupancia en los datasets
+
+prop.table(table(datatraining$Occupancy))
+prop.table(table(datatesting$Occupancy))
+prop.table(table(datatesting2$Occupancy))
+```
+
+```{r}
+ 
+# Comprobamos que no hay NA en los datasets, necesario para el training
+summary(datatraining)
+summary(datatesting)
+summary(datatesting2)
+```
+
+Proporcionamos una gráfica de pares que muestra la relación de todas las variables. Los puntos azules representan el estado ocupado y el verde el estado no ocupado.
+
+```{r}
+#PAIRS
+#No weekday
+cols2 = character(nrow(datatraining))
+cols2[] = "black"
+cols2[datatraining$Occupancy %in% c("0")] = "green"
+cols2[datatraining$Occupancy %in% c("1")] = "blue"
+                         
+pairs(datatraining[2:6], col=cols2, cex=1.1, cex.labels=1.5)
+
+# time in seconds and weekend_weekday
+cols2 = character(nrow(datatraining_b))
+cols2[] = "black"
+cols2[datatraining_b$Occupancy %in% c("0")] = "green"
+cols2[datatraining_b$Occupancy %in% c("1")] = "blue"
+
+pairs(datatraining_b[c(2,3,4,5,6,8)], col=cols2, cex=1.1, cex.labels=1.5)
+```
+
+ Como se puede ver fácilmente entre la temperatura y humedad no hay un límite de separación claro para los puntos azules y verdes. Lo mismo ocurre con las combinaciones de temperatura y CO2, humedad y CO2, temperatura y ratio de humedad, humedad y ratio de humedad y proporción de CO2 y humedad.
+ 
+
+Para tener una mejor idea de la correlación entre variables, calculamos la matriz de correlación y sus p-valores asociados. 
+
+```{r}
+#CORRELACION
+correlation_result=rcorr(as.matrix(datatraining[2:6]))
+correlation_result
+#pvalues
+correlation_result$P
+
+rcorr(as.matrix(datatraining_b[c(2,3,4,5,6,8,9)]),type = "pearson")
+rcorr(as.matrix(datatraining_b[c(2,3,4,5,6,8,9)]),type = "spearman")
+
+correlation_result_b=rcorr(as.matrix(datatraining_b[c(2,3,4,5,6,8,9)]))
+correlation_result_b$P
+```
+
+Como se puede ver en la tabla, las correlaciones son realmente significativas para los pares con un p-value bajo. Por el contrario, las correlaciones no son significativas para los pares: NSM-Humedad y Estado de la semana-NSM. 
+
+Mostramos en un gráfico mas representativo dicha matriz de correlación usando el paquete "Corrplot". Las correlaciones positivas se muestran en azul y las negativas en rojo. Los tamaños de los círculos son proporcionales a los valores de correlación.
+
+```{r}
+# Plotting the correlation plot
+corrplot(correlation_result_b$r,type="upper", order="hclust", tl.col="black", tl.srt=45)
+```
+
+###│ 3. Training y testing
+
+El motivo por el que tenemos dos claros grupos de datasets, es porque probaremos dos ajustes de modelos diferentes, uno con cada grupo (arriba explicados). Esto lo hacemos al darnos cuenta que tanto los segundos del dia en los que se mide y el dia de la semana que sea son bastante significativos, y son datos que sacamos a través del atributo de fecha.
+
+Vamos a ir entrenando modelos distintos donde un modelo es distinto de otro cuando tienen distintas caracteristicas a tener en cuenta.
+
+Los distintos modelos a probar son los siguientes (para cada uno de los grupos): con todas las caracteristicas, solo con la luz, todas pero sin luz. Igual para todos los modelos (Lineal, RF y SVM).
+
+**Empezamos** a probar modelos, es decir, entreamiento del modelo, revisión de los parámetros e hyperparámetros usados, predicción y evaluación del modelo tanto dentro como fuera de la muestra (matriz de confusión).
+
+Utilizaremos la libreria "caret" para el ajuste de los modelos de Regresión Logísitca y Random Forest.
+
+Comenzamos por **Random Forest**. Es habitual que la selección aleatoria de de las variables que actuarán como predictores (parámetro **mtry** en esta librería) sea la raíz cuadrada del número de variables de las que disponemos. A mayor valor de mtry, menos combinaciones de árboles posibles y por tanto, mayor grado de correlación entre los árboles.
+
+```{r}
+#Probando modelos
+# El modelo con X_b incluye los segundos y los weekdays
+
+#RANDOM FOREST
+
+# todas las caracteristicas
+#train
+ModelRF_ALL_b = train(Occupancy~.-date,method="rf",data=datatraining_b)
+ModelRF_ALL_b
+plot(ModelRF_ALL_b)
+ModelRF_ALL_b$finalModel
+varImp(ModelRF_ALL_b)
+plot(varImp(ModelRF_ALL_b,scale=TRUE))
+
+#Predicciones
+#train
+confusionMatrix(datatraining_b$Occupancy,predict(ModelRF_ALL_b,datatraining_b))
+
+#test1
+confusionMatrix(datatesting_b$Occupancy,predict(ModelRF_ALL_b,datatesting_b))
+
+#test2
+confusionMatrix(datatesting2_b$Occupancy,predict(ModelRF_ALL_b,datatesting2_b))
+
+ein_RF_ALL_b=sum(datatraining_b$Occupancy==predict(ModelRF_ALL_b,datatraining_b))/dim(datatraining_b)[1]*100
+eout1_RF_ALL_b=sum(datatesting_b$Occupancy==predict(ModelRF_ALL_b,datatesting_b))/dim(datatesting_b)[1]*100
+eout2_RF_ALL_b=sum(datatesting2_b$Occupancy==predict(ModelRF_ALL_b,datatesting2_b))/dim(datatesting2_b)[1]*100
+
+# solo luz
+#train
+ModelRF_Light_b = train(Occupancy~.-date-CO2-Temperature-HumidityRatio-Humidity,method="rf",data=datatraining_b)
+ModelRF_Light_b
+plot(ModelRF_Light_b)
+ModelRF_Light_b$finalModel
+varImp(ModelRF_Light_b)
+plot(varImp(ModelRF_Light_b,scale=TRUE))
+
+#Predicciones
+#train
+confusionMatrix(datatraining_b$Occupancy,predict(ModelRF_Light_b,datatraining_b))
+
+#test1
+confusionMatrix(datatesting_b$Occupancy,predict(ModelRF_Light_b,datatesting_b))
+
+#test2
+confusionMatrix(datatesting2_b$Occupancy,predict(ModelRF_Light_b,datatesting2_b))
+
+ein_RF_Light_b=sum(datatraining_b$Occupancy==predict(ModelRF_Light_b,datatraining_b))/dim(datatraining_b)[1]*100
+eout1_RF_Light_b=sum(datatesting_b$Occupancy==predict(ModelRF_Light_b,datatesting_b))/dim(datatesting_b)[1]*100
+eout2_RF_Light_b=sum(datatesting2_b$Occupancy==predict(ModelRF_Light_b,datatesting2_b))/dim(datatesting2_b)[1]*100
+
+# SIN luz
+#train
+ModelRF_ALLNoLight_b = train(Occupancy~.-date-Light,method="rf",data=datatraining_b)
+ModelRF_ALLNoLight_b
+plot(ModelRF_ALLNoLight_b)
+ModelRF_ALLNoLight_b$finalModel
+varImp(ModelRF_ALLNoLight_b)
+plot(varImp(ModelRF_ALLNoLight_b,scale=TRUE))
+
+#Predicciones
+#train
+confusionMatrix(datatraining_b$Occupancy,predict(ModelRF_ALLNoLight_b,datatraining_b))
+
+#test1
+confusionMatrix(datatesting_b$Occupancy,predict(ModelRF_ALLNoLight_b,datatesting_b))
+
+#test2
+confusionMatrix(datatesting2_b$Occupancy,predict(ModelRF_ALLNoLight_b,datatesting2_b))
+
+ein_RF_ALLNoLight_b=sum(datatraining_b$Occupancy==predict(ModelRF_ALLNoLight_b,datatraining_b))/dim(datatraining_b)[1]*100
+eout1_RF_ALLNoLight_b=sum(datatesting_b$Occupancy==predict(ModelRF_ALLNoLight_b,datatesting_b))/dim(datatesting_b)[1]*100
+eout2_RF_ALLNoLight_b=sum(datatesting2_b$Occupancy==predict(ModelRF_ALLNoLight_b,datatesting2_b))/dim(datatesting2_b)[1]*100
+
+#Igual pero sin tener en cuenta los segundos del dia y el weekday
+# todas las caracteristicas
+#train
+ModelRF_ALL = train(Occupancy~.-date,method="rf",data=datatraining)
+ModelRF_ALL
+plot(ModelRF_ALL)
+ModelRF_ALL$finalModel
+varImp(ModelRF_ALL)
+plot(varImp(ModelRF_ALL,scale=TRUE))
+
+#Predicciones
+#train
+confusionMatrix(datatraining$Occupancy,predict(ModelRF_ALL,datatraining))
+
+#test1
+confusionMatrix(datatesting$Occupancy,predict(ModelRF_ALL,datatesting))
+
+#test2
+confusionMatrix(datatesting2$Occupancy,predict(ModelRF_ALL,datatesting2))
+
+ein_RF_ALL=sum(datatraining_b$Occupancy==predict(ModelRF_ALL,datatraining_b))/dim(datatraining_b)[1]*100
+eout1_RF_ALL=sum(datatesting_b$Occupancy==predict(ModelRF_ALL,datatesting_b))/dim(datatesting_b)[1]*100
+eout2_RF_ALL=sum(datatesting2_b$Occupancy==predict(ModelRF_ALL,datatesting2_b))/dim(datatesting2_b)[1]*100
+
+# solo luz
+#train
+ModelRF_Light = train(Occupancy~.-date-CO2-Temperature-HumidityRatio-Humidity,method="rf",data=datatraining)
+ModelRF_Light
+#plot(ModelRF_Light)
+ModelRF_Light$finalModel
+#varImp(ModelRF_Light)
+#plot(varImp(ModelRF_Light,scale=TRUE))
+
+#Predicciones
+#train
+confusionMatrix(datatraining$Occupancy,predict(ModelRF_Light,datatraining))
+
+#test1
+confusionMatrix(datatesting$Occupancy,predict(ModelRF_Light,datatesting))
+
+#test2
+confusionMatrix(datatesting2$Occupancy,predict(ModelRF_Light,datatesting2))
+
+ein_RF_Light=sum(datatraining_b$Occupancy==predict(ModelRF_Light,datatraining_b))/dim(datatraining_b)[1]*100
+eout1_RF_Light=sum(datatesting_b$Occupancy==predict(ModelRF_Light,datatesting_b))/dim(datatesting_b)[1]*100
+eout2_RF_Light=sum(datatesting2_b$Occupancy==predict(ModelRF_Light,datatesting2_b))/dim(datatesting2_b)[1]*100
+
+# SIN luz
+#train
+ModelRF_ALLNoLight = train(Occupancy~.-date-Light,method="rf",data=datatraining)
+ModelRF_ALLNoLight
+plot(ModelRF_ALLNoLight)
+ModelRF_ALLNoLight$finalModel
+varImp(ModelRF_ALLNoLight)
+plot(varImp(ModelRF_ALLNoLight,scale=TRUE))
+
+#Predicciones
+
+#train
+confusionMatrix(datatraining$Occupancy,predict(ModelRF_ALLNoLight,datatraining))
+
+#test1
+confusionMatrix(datatesting$Occupancy,predict(ModelRF_ALLNoLight,datatesting))
+
+#test2
+confusionMatrix(datatesting2$Occupancy,predict(ModelRF_ALLNoLight,datatesting2))
+
+ein_RF_ALLNoLight=sum(datatraining_b$Occupancy==predict(ModelRF_ALLNoLight,datatraining_b))/dim(datatraining_b)[1]*100
+eout1_RF_ALLNoLight=sum(datatesting_b$Occupancy==predict(ModelRF_ALLNoLight,datatesting_b))/dim(datatesting_b)[1]*100
+eout2_RF_ALLNoLight=sum(datatesting2_b$Occupancy==predict(ModelRF_ALLNoLight,datatesting2_b))/dim(datatesting2_b)[1]*100
+
+```
+
+Para todos los modelos de Random Forest, el entrenamiento se realizó usando 25 muestras (usando bootstrap). El algoritmo selecciona automáticamente el mejor número de divisiones de acuerdo con la mayor precisión de los RF entrenados.
+El número de árboles para cada modelo es 500, ya que se verifica que no disminuye significativamente la predicción con más árboles.
+
+**REGRESIÓN LOGÍSTICA**
+``` {R}
+#REGRESION LOGISTICA
+# todas las caracteristicas
+#train
+ModelRL_ALL_b = train(Occupancy~.-date,method="glm",data=datatraining_b)
+ModelRL_ALL_b
+#plot(ModelRL_ALL_b)
+ModelRL_ALL_b$finalModel
+varImp(ModelRL_ALL_b)
+plot(varImp(ModelRL_ALL_b,scale=TRUE))
+
+#Predicciones
+#train
+confusionMatrix(datatraining_b$Occupancy,predict(ModelRL_ALL_b,datatraining_b))
+
+#test1
+confusionMatrix(datatesting_b$Occupancy,predict(ModelRL_ALL_b,datatesting_b))
+
+#test2
+confusionMatrix(datatesting2_b$Occupancy,predict(ModelRL_ALL_b,datatesting2_b))
+
+ein_RL_ALL_b=sum(datatraining_b$Occupancy==predict(ModelRL_ALL_b,datatraining_b))/dim(datatraining_b)[1]*100
+eout1_RL_ALL_b=sum(datatesting_b$Occupancy==predict(ModelRL_ALL_b,datatesting_b))/dim(datatesting_b)[1]*100
+eout2_RL_ALL_b=sum(datatesting2_b$Occupancy==predict(ModelRL_ALL_b,datatesting2_b))/dim(datatesting2_b)[1]*100
+
+# solo luz
+#train
+ModelRL_Light_b = train(Occupancy~.-date-CO2-Temperature-HumidityRatio-Humidity,method="glm",data=datatraining_b)
+ModelRL_Light_b
+#plot(ModelRL_Light_b)
+ModelRL_Light_b$finalModel
+varImp(ModelRL_Light_b)
+plot(varImp(ModelRL_Light_b,scale=TRUE))
+
+#Predicciones
+#train
+confusionMatrix(datatraining_b$Occupancy,predict(ModelRL_Light_b,datatraining_b))
+
+#test1
+confusionMatrix(datatesting_b$Occupancy,predict(ModelRL_Light_b,datatesting_b))
+
+#test2
+confusionMatrix(datatesting2_b$Occupancy,predict(ModelRL_Light_b,datatesting2_b))
+
+ein_RL_Light_b=sum(datatraining_b$Occupancy==predict(ModelRL_Light_b,datatraining_b))/dim(datatraining_b)[1]*100
+eout1_RL_Light_b=sum(datatesting_b$Occupancy==predict(ModelRL_Light_b,datatesting_b))/dim(datatesting_b)[1]*100
+eout2_RL_Light_b=sum(datatesting2_b$Occupancy==predict(ModelRL_Light_b,datatesting2_b))/dim(datatesting2_b)[1]*100
+
+# SIN luz
+#train
+ModelRL_ALLNoLight_b = train(Occupancy~.-date-Light,method="glm",data=datatraining_b)
+ModelRL_ALLNoLight_b
+#plot(ModelRL_ALLNoLight_b)
+ModelRL_ALLNoLight_b$finalModel
+varImp(ModelRL_ALLNoLight_b)
+plot(varImp(ModelRL_ALLNoLight_b,scale=TRUE))
+
+#Predicciones
+#train
+confusionMatrix(datatraining_b$Occupancy,predict(ModelRL_ALLNoLight_b,datatraining_b))
+
+#test1
+confusionMatrix(datatesting_b$Occupancy,predict(ModelRL_ALLNoLight_b,datatesting_b))
+
+#test2
+confusionMatrix(datatesting2_b$Occupancy,predict(ModelRL_ALLNoLight_b,datatesting2_b))
+
+ein_RL_ALLNoLight_b=sum(datatraining_b$Occupancy==predict(ModelRL_ALLNoLight_b,datatraining_b))/dim(datatraining_b)[1]*100
+eout1_RL_ALLNoLight_b=sum(datatesting_b$Occupancy==predict(ModelRL_ALLNoLight_b,datatesting_b))/dim(datatesting_b)[1]*100
+eout2_RL_ALLNoLight_b=sum(datatesting2_b$Occupancy==predict(ModelRL_ALLNoLight_b,datatesting2_b))/dim(datatesting2_b)[1]*100
+
+#Igual pero sin tener en cuenta los segundos del dia y el weekday
+# todas las caracteristicas
+#train
+ModelRL_ALL = train(Occupancy~.-date,method="glm",data=datatraining)
+ModelRL_ALL
+#plot(ModelRL_ALL)
+ModelRL_ALL$finalModel
+varImp(ModelRL_ALL)
+plot(varImp(ModelRL_ALL,scale=TRUE))
+
+#Predicciones
+#train
+confusionMatrix(datatraining$Occupancy,predict(ModelRL_ALL,datatraining))
+
+#test1
+confusionMatrix(datatesting$Occupancy,predict(ModelRL_ALL,datatesting))
+
+#test2
+confusionMatrix(datatesting2$Occupancy,predict(ModelRL_ALL,datatesting2))
+
+ein_RL_ALL=sum(datatraining_b$Occupancy==predict(ModelRL_ALL,datatraining_b))/dim(datatraining_b)[1]*100
+eout1_RL_ALL=sum(datatesting_b$Occupancy==predict(ModelRL_ALL,datatesting_b))/dim(datatesting_b)[1]*100
+eout2_RL_ALL=sum(datatesting2_b$Occupancy==predict(ModelRL_ALL,datatesting2_b))/dim(datatesting2_b)[1]*100
+
+# solo luz
+#train
+ModelRL_Light = train(Occupancy~.-date-CO2-Temperature-HumidityRatio-Humidity,method="glm",data=datatraining)
+ModelRL_Light
+#plot(ModelRL_Light)
+ModelRL_Light$finalModel
+varImp(ModelRL_Light)
+plot(varImp(ModelRL_Light,scale=TRUE))
+
+#Predicciones
+#train
+confusionMatrix(datatraining$Occupancy,predict(ModelRL_Light,datatraining))
+
+#test1
+confusionMatrix(datatesting$Occupancy,predict(ModelRL_Light,datatesting))
+
+#test2
+confusionMatrix(datatesting2$Occupancy,predict(ModelRL_Light,datatesting2))
+
+ein_RL_Light=sum(datatraining_b$Occupancy==predict(ModelRL_Light,datatraining_b))/dim(datatraining_b)[1]*100
+eout1_RL_Light=sum(datatesting_b$Occupancy==predict(ModelRL_Light,datatesting_b))/dim(datatesting_b)[1]*100
+eout2_RL_Light=sum(datatesting2_b$Occupancy==predict(ModelRL_Light,datatesting2_b))/dim(datatesting2_b)[1]*100
+
+# SIN luz
+#train
+ModelRL_ALLNoLight = train(Occupancy~.-date-Light,method="glm",data=datatraining)
+ModelRL_ALLNoLight
+#plot(ModelRL_ALLNoLight)
+ModelRL_ALLNoLight$finalModel
+varImp(ModelRL_ALLNoLight)
+plot(varImp(ModelRL_ALLNoLight,scale=TRUE))
+
+#Predicciones
+
+#train
+confusionMatrix(datatraining$Occupancy,predict(ModelRL_ALLNoLight,datatraining))
+#100.0
+
+#test1
+confusionMatrix(datatesting$Occupancy,predict(ModelRL_ALLNoLight,datatesting))
+
+#test2
+confusionMatrix(datatesting2$Occupancy,predict(ModelRL_ALLNoLight,datatesting2))
+
+ein_RL_ALLNoLight=sum(datatraining_b$Occupancy==predict(ModelRL_ALLNoLight,datatraining_b))/dim(datatraining_b)[1]*100
+eout1_RL_ALLNoLight=sum(datatesting_b$Occupancy==predict(ModelRL_ALLNoLight,datatesting_b))/dim(datatesting_b)[1]*100
+eout2_RL_ALLNoLight=sum(datatesting2_b$Occupancy==predict(ModelRL_ALLNoLight,datatesting2_b))/dim(datatesting2_b)[1]*100
+
+
+##REGRESION LOGISTICA CON REGULARIZACION LASSO
+x=as.matrix(datatraining_b[,c(2,3,4,5,6,8,9)])
+y=datatraining_b[,7]
+
+ModelRL_Lasso = glmnet(x,y, alpha=1, family="binomial", standardize = F)
+
+plot(ModelRL_Lasso, xvar="lambda")
+#Una vez obtenidos los coeficientes para cada uno de los lambda, vemos cual de ellos es el mejor con CV
+
+cv.ModelRL_Lasso = cv.glmnet(x, as.double(y), alpha=1)
+plot(cv.ModelRL_Lasso)
+best_lambda=cv.ModelRL_Lasso$lambda.min
+best_lambda
+
+#Ahora vemos los coeficientes elegidos para ese lambda
+coef(ModelRL_Lasso)[,70]
+
+train=as.matrix(datatraining_b[c(2,3,4,5,6,8,9)])
+test1=as.matrix(datatesting_b[c(2,3,4,5,6,8,9)])
+test2=as.matrix(datatesting2_b[c(2,3,4,5,6,8,9)])
+
+#Predecimos con esos coeficientes
+
+ein_RL_Lasso=sum(datatraining_b$Occupancy==predict(ModelRL_Lasso, s=best_lambda, newx = train, type = "class", intercept=F))/dim(datatraining_b)[1]*100
+eout1_RL_Lasso=sum(datatesting_b$Occupancy==predict(ModelRL_Lasso, s=best_lambda, newx = test1, type = "class", intercept=F))/dim(datatesting_b)[1]*100
+eout2_RL_Lasso=sum(datatesting2_b$Occupancy==predict(ModelRL_Lasso, s=best_lambda, newx = test2, type = "class", intercept=F))/dim(datatesting2_b)[1]*100
+```
+
+Probamos todos los modelos de regresión logísitca antes mencionados sin regularización y posteriormente con regularización Lasso.
+Como podemos ver, al usar regularización se queda con la luz como única característica, ya que, como venimos viendo desde el principio de las pruebas de cada modelo, la luz parece la característica mas significativa.
+
+**SVM**
+
+Comenzaremos hablando de este modelo, la máquina de vectores de soporte se obtiene mediante la resolución del espacio dual de Lagrange de la formulación primal como sigue:
+$f(x)=\sum_{i=1}^{N}\alpha_{i}*y_{i}*K(x,x_{i})+b$, donde N es el número de vectores de soporte.
+
+Este modelo se basa en la obtención de un hiperplano separador con un margen que intenta ser óptimo, puede que lo sea o nom esto último lo determina el parámetro C. Este parámetro es el asociado a la regularización, un bajo valor de C signigica que se deja mucho margen a la hora de ajustar y debido a esto algunas muestras pueden quedar mla clasificadas. Por otro lado, un valor alto del parámetro C significa justo lo contrario, que se deja un margen más pequeño para ajustar mejor.
+Una de las virtudes de este método es que pude realizar transformaciones no lineales gracias al kernel. En nuestro caso se nos indica que probemos con un kernel polinomial o un kernel Gaussiano, en nuestro caso despues de hacer pruebas decidimos quedarnos con el kernel gaussiano ya que proporcionaba un mejor rendimiento.
+La transformación que hace este kernel viene dada por $K(x,y)=exp(-\frac{||x-y||^{2}}{2\sigma^{2}})$
+
+Usaremos SVM y Cross Validation para hallar los parámetros libres de manera mas óptima, aunque debido al tiempo que tarda el algoritmo en converger para hallar dichos parámetros, especificamos nosotros un rango de valores para cada uno de ellos (sigma y C).
+
+```{r}
+
+# SVM: todas als características
+
+#preparacion de los dataset especificos para SVM
+
+datatraining1 = datatraining_b
+datatraining1$Occupancy = factor(datatraining$Occupancy, levels = c(1,0), labels = c("SI", "NO"))
+
+datatesting1 = datatesting_b
+datatesting1$Occupancy = factor(datatesting$Occupancy, levels = c(1,0), labels = c("SI", "NO"))
+datatesting3 = datatesting2_b
+datatesting3$Occupancy = factor(datatesting2$Occupancy, levels = c(1,0), labels = c("SI", "NO"))
+
+trControl = trainControl(method="cv", number = 5,
+                         summaryFunction = twoClassSummary,
+                         classProbs = T, savePredictions = T)
+
+
+grid = expand.grid(sigma = seq(0.01, 1, 0.05), C = c(0.6, 0.8, 1))
+
+#model_SVM = train(Occupancy~.-date, data = datatraining1, method = "svmRadial", trControl = trControl, metric = "ROC", tuneGrid = grid, scale = FALSE)
+# model_SVM
+
+# prediccion = predict(model_SVM, datatraining1) == datatraining1$Occupancy
+# ein_SVM_ALL_b = length(prediccion[prediccion==TRUE])/dim(datatraining1)[1]*100
+ein_SVM_ALL_b=100
+
+# prediccion = predict(model_SVM, datatesting1) == datatesting1$Occupancy
+# eout_SVM_ALL_b = length(prediccion[prediccion==TRUE])/dim(datatesting1)[1]*100
+eout1_SVM_ALL_b=75.8349
+
+# prediccion = predict(model_SVM, datatesting3) == datatesting3$Occupancy
+# eout_SVM_ALL_b = length(prediccion[prediccion==TRUE])/dim(datatesting3)[1]*100
+eout2_SVM_ALL_b=26.84578
+
+# Modelo sin segundos y tipo de dia
+
+datatraining1 = datatraining
+datatraining1$Occupancy = factor(datatraining$Occupancy, levels = c(1,0), labels = c("SI", "NO"))
+
+datatesting1 = datatesting
+datatesting1$Occupancy = factor(datatesting$Occupancy, levels = c(1,0), labels = c("SI", "NO"))
+datatesting3 = datatesting2
+datatesting3$Occupancy = factor(datatesting2$Occupancy, levels = c(1,0), labels = c("SI", "NO"))
+
+trControl = trainControl(method="cv", number = 5,
+                         summaryFunction = twoClassSummary,
+                         classProbs = T, savePredictions = T)
+
+
+grid = expand.grid(sigma = seq(0.01, 1, 0.05), C = c(0.6, 0.8, 1))
+
+# model_SVM = train(Occupancy~.-date, data = datatraining1, method = "svmRadial", trControl = trControl, metric = "ROC", tuneGrid = grid, scale = FALSE)
+# model_SVM
+
+# prediccion = predict(model_SVM, datatraining1) == datatraining1$Occupancy
+# ein_SVM_ALL_b = length(prediccion[prediccion==TRUE])/dim(datatraining1)[1]*100
+ein_SVM_ALL=99.4479
+
+# prediccion = predict(model_SVM, datatesting1) == datatesting1$Occupancy
+# eout_SVM_ALL_b = length(prediccion[prediccion==TRUE])/dim(datatesting1)[1]*100
+eout1_SVM_ALL=95.23452
+
+# prediccion = predict(model_SVM, datatesting3) == datatesting3$Occupancy
+# eout_SVM_ALL_b = length(prediccion[prediccion==TRUE])/dim(datatesting3)[1]*100
+eout2_SVM_ALL=86.97703
+
+ROC_curve = function(modelo, indices, caption) {
+
+  print(confusionMatrix(modelo))
+
+  pred = prediction(as.numeric(modelo$pred$pred[indices]), as.numeric(modelo$pred$obs[indices]))
+  perf = performance(pred, "tpr", "fpr")
+  
+  plot(perf, lwd=2, colorize = TRUE, main=paste('ROC curve for 5-fold Cross validation', caption))
+}
+
+# Cogemos los valores del mejor ajuste
+# selectedIndex1 = model_SVM$pred$C == model_SVM$bestTune$C & model_SVM$pred$sigma == model_SVM$bestTune$sigma
+
+# ROC_curve(model_SVM,selectedIndex1, "SVM")
+
+# Cogemos los valores del mejor ajuste
+# indexes = model_SVM$pred$C == model_SVM$bestTune$C & 
+# model_SVM$pred$sigma == model_SVM$bestTune$sigma
+
+# print_roc(model_SVM,indexes, "SVM")
+```
+
+Una vez hemos entrenado el modelo, podemos ver que el ajuste que ofrece es casi perfecto pero debido a la complejidad del problema de asignación cuadrática hace que el entrenamiento sea muy largo debido a la muestra de entrenamineto. El mejor modelo obtenido es uno con un sigma muy cercano a 0 (0.1), es decir, la transformación que haces e una transformación exponencial de bastante menos la mitad de la distancia Euclídea entre los dos puntos del espacio de nuestro problema. Por otro lado el valor de C (regularización) no es excesivamente bajo ni tampoco muy alto (0.6) por lo que nos proporciona un margen que nos permite tener cierto ruid0 pero por otro lado no tendremos sobreajuste.
+
+
+### 4. COMPARACIONES
+
+```{r}
+all_RL_b=c("RL", "All_b", ein_RL_ALL_b, eout1_RL_ALL_b, eout2_RL_ALL_b)
+noLight_RL_b=c("RL", "No Light_b", ein_RL_ALLNoLight_b, eout1_RL_ALLNoLight_b, eout2_RL_ALLNoLight_b)
+onlyLight_RL_b=c("RL", "Only Light_b", ein_RL_Light_b, eout1_RL_Light_b, eout2_RL_Light_b)
+all_RL=c("RL", "All", ein_RL_ALL, eout1_RL_ALL, eout2_RL_ALL)
+noLight_RL=c("RL", "No Light", ein_RL_ALL, eout1_RL_ALL, eout2_RL_ALL)
+onlyLight_RL=c("RL", "Only Light", ein_RL_ALL, eout1_RL_ALL, eout2_RL_ALL)
+Lasso_RL_b=c("RL", "Lasso", ein_RL_Lasso, eout1_RL_Lasso, eout2_RL_Lasso)
+
+all_RF_b=c("RF", "All_b", ein_RF_ALL_b, eout1_RF_ALL_b, eout2_RF_ALL_b)
+noLight_RF_b=c("RF", "No Light_b", ein_RF_ALLNoLight_b, eout1_RF_ALLNoLight_b, eout2_RF_ALLNoLight_b)
+onlyLight_RF_b=c("RF", "Only Light_b", ein_RF_Light_b, eout1_RF_Light_b, eout2_RF_Light_b)
+all_RF=c("RF", "All", ein_RF_ALL, eout1_RF_ALL, eout2_RF_ALL)
+noLight_RF=c("RF", "No Light", ein_RF_ALL, eout1_RF_ALL, eout2_RF_ALL)
+onlyLight_RF=c("RF", "Only Light", ein_RF_ALL, eout1_RF_ALL, eout2_RF_ALL)
+
+SVM_All_b=c("SVM", "All_b", ein_SVM_ALL_b, eout1_SVM_ALL_b, eout2_SVM_ALL_b)
+SVM_All=c("SVM", "All", ein_SVM_ALL, eout1_SVM_ALL, eout2_SVM_ALL)
+
+encabezado=c("Modelo", "Características", "Ein", "Eout1", "Eout2")
+
+tabla_comparaciones=rbind(encabezado, all_RL_b, noLight_RL_b, all_RL, noLight_RL, onlyLight_RL, Lasso_RL_b, all_RF_b, noLight_RF_b, onlyLight_RF_b, all_RF, noLight_RF, onlyLight_RF, SVM_All_b, SVM_All)
+
+tabla_comparaciones
+```
+
+
